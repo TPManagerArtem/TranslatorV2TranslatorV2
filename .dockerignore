@@ -1,0 +1,22 @@
+# Git files
+.git
+.gitignore
+
+# Node.js dependencies - they will be installed inside the container
+node_modules
+
+# Python virtual environment
+venv
+.venv
+
+# IDE settings
+.idea
+
+# Python cache
+__pycache__
+
+# Local environment files - secrets will be injected by Cloud Run
+.env
+
+# Test files
+test.pdf

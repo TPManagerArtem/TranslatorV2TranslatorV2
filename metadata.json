@@ -1,0 +1,5 @@
+{
+  "name": "PDF-to-DOCX Structural Converter",
+  "description": "An intelligent web application that converts PDF files, including scanned documents, into well-structured, editable DOCX files. It uses a parallel processing pipeline with Gemini AI to accurately recognize text, headings, paragraphs, and tables, preserving the original document layout.",
+  "requestFramePermissions": []
+}
