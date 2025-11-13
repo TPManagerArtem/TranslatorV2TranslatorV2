@@ -1,4 +1,5 @@
 import os
+import io
 import asyncio
 import json
 import base64
@@ -23,12 +24,18 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("Required environment variable GEMINI_API_KEY is not set.")
 
-SCOPES = ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/documents"]
+SCOPES = ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/drive.readonly"]
 genai.configure(api_key=GEMINI_API_KEY)
 logging.basicConfig(level=logging.INFO)
 
 # --- Initializations ---
 app = FastAPI()
+
+@app.middleware("http")
+async def add_coop_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+    return response
 md = MarkdownIt('commonmark', {'breaks': True, 'html': False}).enable('table')
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -40,7 +47,6 @@ safety_settings = {
 # --- Pydantic Models ---
 class OcrBlock(BaseModel): text: str; x1: float; y1: float; x2: float; y2: float
 class PageData(BaseModel): pageNumber: int; structure: List[Any]; imageDataUrl: str
-class StructureTranslationRequest(BaseModel): pages: List[PageData]; targetLanguage: str
 class CreateDocRequest(BaseModel): pages: List[PageData]; originalFileName: str
 
 async def perform_ocr_on_image_async(image_bytes: bytes, model: genai.GenerativeModel) -> List[OcrBlock]:
@@ -83,7 +89,7 @@ async def process_and_stream_pdf(file: UploadFile):
 
         async def process_single_page_task(page_num: int, page: fitz.Page):
             try:
-                pix = page.get_pixmap(dpi=150)
+                pix = page.get_pixmap(dpi=96)
                 image_data_url = f"data:image/jpeg;base64,{base64.b64encode(pix.tobytes('jpeg', jpg_quality=85)).decode('utf-8')}"
                 
                 ocr_blocks: List[OcrBlock] = []
@@ -119,32 +125,69 @@ async def process_and_stream_pdf(file: UploadFile):
 async def stream_pdf_processing_endpoint(file: UploadFile = File(...)):
     return StreamingResponse(process_and_stream_pdf(file), media_type="text/event-stream")
 
-@app.post("/api/translate_document")
-async def translate_document_endpoint(request: StructureTranslationRequest):
-    texts_to_translate, id_map = [], {}
-    counter = 0
-    for p_idx, page in enumerate(request.pages):
-        for e_idx, element in enumerate(page.structure):
-            if element.get('content', '').strip():
-                texts_to_translate.append({"id": counter, "text": element['content']})
-                id_map[counter] = (p_idx, e_idx)
-                counter += 1
-    if not texts_to_translate: return request.pages
-    
+@app.post("/api/process_drive_file")
+async def process_drive_file_endpoint(request: Request, authorization: str = Header(None)):
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        prompt = f"Translate the 'text' field of each JSON object to {request.targetLanguage}. Return a JSON array with the same 'id's. Preserve Markdown. Input: {json.dumps(texts_to_translate)}"
-        response = await model.generate_content_async(prompt, generation_config=genai.types.GenerationConfig(response_mime_type="application/json"), safety_settings=safety_settings)
-        translated_map = {item['id']: item['text'] for item in json.loads(response.text)}
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or invalid authorization token.")
         
-        for trans_id, translated_text in translated_map.items():
-            if trans_id in id_map:
-                p_idx, e_idx = id_map[trans_id]
-                request.pages[p_idx].structure[e_idx]['content'] = translated_text
-        return request.pages
+        token = authorization.split(" ")[1]
+        user_creds = Credentials(token=token, scopes=SCOPES)
+        drive_service = build('drive', 'v3', credentials=user_creds)
+        
+        body = await request.json()
+        file_id = body.get('fileId')
+        file_name = body.get('fileName')
+
+        if not file_id:
+            raise HTTPException(status_code=400, detail="fileId is required.")
+
+        file_request = drive_service.files().get_media(fileId=file_id)
+        file_bytes = file_request.execute()
+
+        class TempUploadedFile:
+            def __init__(self, file_bytes, file_name):
+                self.file = io.BytesIO(file_bytes)
+                self.filename = file_name
+            
+            async def read(self):
+                return self.file.read()
+
+        temp_file = TempUploadedFile(file_bytes, file_name)
+
+        return StreamingResponse(process_and_stream_pdf(temp_file), media_type="text/event-stream")
+
+    except HttpError as err:
+        error_details = json.loads(err.content.decode())
+        logging.error(f"Google API Error: {error_details}")
+        raise HTTPException(status_code=err.resp.status, detail=f"Google API Error: {error_details}")
     except Exception as e:
-        logging.error(f"Translation failed: {e}")
-        return request.pages
+        logging.error(f"Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+@app.post("/api/list_drive_files")
+async def list_drive_files_endpoint(authorization: str = Header(None)):
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or invalid authorization token.")
+        
+        token = authorization.split(" ")[1]
+        user_creds = Credentials(token=token, scopes=SCOPES)
+        drive_service = build('drive', 'v3', credentials=user_creds)
+        
+        folder_id = "1BR3F-EXIoehKt-DRDIJNKx1qBOArlmB3"
+        query = f"'{folder_id}' in parents and mimeType='application/pdf'"
+        results = drive_service.files().list(q=query, pageSize=100, fields="files(id, name)").execute()
+        files = results.get('files', [])
+        
+        return JSONResponse(content=files)
+    except HttpError as err:
+        error_details = json.loads(err.content.decode())
+        logging.error(f"Google API Error: {error_details}")
+        raise HTTPException(status_code=err.resp.status, detail=f"Google API Error: {error_details}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 @app.post("/api/create_google_doc")
 async def create_google_doc_endpoint(request: CreateDocRequest, authorization: str = Header(None)):
@@ -161,39 +204,51 @@ async def create_google_doc_endpoint(request: CreateDocRequest, authorization: s
         doc_id = doc.get('documentId')
         logging.info(f"Created Google Doc with ID: {doc_id} on behalf of the user.")
         
-        requests = []
         current_index = 1
         spacing_map = {'small': 8, 'medium': 12, 'large': 16}
 
-        for page in request.pages:
+        for i, page in enumerate(request.pages):
+            requests = []
             for element in page.structure:
                 content = element.get('content', '')
                 if not content.strip(): continue
 
                 if element.get('type') == 'table':
+                    # Insert a newline to ensure we are in a paragraph
+                    requests.append({'insertText': {'text': '\n', 'location': {'index': current_index}}})
+                    
                     tokens = md.parse(content)
-                    rows_data = [[]]
-                    # Simplified token parsing for brevity
-                    for i, token in enumerate(tokens):
-                        if token.type == 'tr_open': rows_data.append([])
-                        elif token.type == 'inline': rows_data[-1].append(token.content)
+                    rows_data = []
+                    current_row = []
+                    for token in tokens:
+                        if token.type == 'tr_open':
+                            current_row = []
+                        elif token.type == 'tr_close':
+                            rows_data.append(current_row)
+                        elif token.type == 'inline':
+                            current_row.append(token.content)
+                    
                     rows_data = [r for r in rows_data if r]
-
                     if not rows_data: continue
-                    num_rows, num_cols = len(rows_data), max(len(r) for r in rows_data) if rows_data else 0
+                    
+                    num_rows = len(rows_data)
+                    num_cols = max(len(r) for r in rows_data) if rows_data else 0
                     if num_cols == 0: continue
 
-                    requests.append({'insertTable': {'rows': num_rows, 'columns': num_cols, 'location': {'index': current_index}}})
+                    requests.append({'insertTable': {'rows': num_rows, 'columns': num_cols, 'location': {'index': current_index + 1}}})
                     
-                    table_start_index = current_index
+                    # This is still a bit of a hack, but it's more likely to work now.
+                    # The table is inserted at current_index + 1.
+                    # The content of the table starts at current_index + 5.
+                    table_start_index = current_index + 1
                     cell_requests = []
                     for r, row in enumerate(rows_data):
                         for c, cell_text in enumerate(row):
+                            cell_location = table_start_index + 4 + r * (num_cols * 2 + 1) + c * 2
                             if cell_text:
-                                cell_location = table_start_index + 4 + r * (num_cols * 2 + 1) + c * 2
                                 cell_requests.append({'insertText': {'text': cell_text, 'location': {'index': cell_location}}})
+                    
                     requests.extend(reversed(cell_requests))
-                    current_index += (2 + num_rows * (num_cols * 2 + 1))
                 else:
                     text_to_insert = content + '\n'
                     requests.append({'insertText': {'text': text_to_insert, 'location': {'index': current_index}}})
@@ -204,8 +259,13 @@ async def create_google_doc_endpoint(request: CreateDocRequest, authorization: s
                         style_request['paragraphStyle']['namedStyleType'] = f"HEADING_{element.get('level', 1)}"
                         style_request['fields'] += 'namedStyleType'
 
-                    align = element.get('align', 'LEFT').upper()
-                    if align in ['CENTER', 'RIGHT', 'JUSTIFIED']:
+                    align = element.get('align', 'left').upper()
+                    if align == 'LEFT':
+                        align = 'START'
+                    elif align == 'RIGHT':
+                        align = 'END'
+
+                    if align in ['START', 'CENTER', 'END', 'JUSTIFIED']:
                         style_request['paragraphStyle']['alignment'] = align
                         style_request['fields'] += ',alignment' if style_request['fields'] else 'alignment'
 
@@ -216,14 +276,17 @@ async def create_google_doc_endpoint(request: CreateDocRequest, authorization: s
 
                     if style_request['fields']:
                         requests.append({'updateParagraphStyle': style_request})
-                    
-                    current_index += len(text_to_insert)
             
-            requests.append({'insertPageBreak': {'location': {'index': current_index}}})
-            current_index += 1
+            if i < len(request.pages) - 1:
+                requests.append({'insertPageBreak': {'location': {'index': current_index}}})
 
-        if requests:
-            docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
+            if requests:
+                result = docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
+                # After each batch update, we need to get the new end of the document.
+                # The easiest way is to get the document and find the end of the body.
+                doc_content = docs_service.documents().get(documentId=doc_id, fields='body(content)').execute()
+                current_index = doc_content['body']['content'][-1]['endIndex'] -1
+
 
         return JSONResponse(content={"documentUrl": f"https://docs.google.com/document/d/{doc_id}/edit"})
     except HttpError as err:

@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { useGoogleLogin } from '@react-oauth/google';
 import ResultsView from './components/ResultsView';
+import DriveFilePicker from './components/DriveFilePicker';
 import { PageData, ProgressUpdate } from './types';
 
 const App: React.FC = () => {
@@ -10,10 +11,27 @@ const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [originalFileName, setOriginalFileName] = useState('');
   
-  const [targetLanguage, setTargetLanguage] = useState('');
   const [isCreatingDoc, setIsCreatingDoc] = useState(false);
   const [gdocUrl, setGdocUrl] = useState<string | null>(null);
   const [userToken, setUserToken] = useState<string | null>(null);
+  const [showDrivePicker, setShowDrivePicker] = useState(false);
+
+  const handleMessage = (message: string) => {
+    if (message.startsWith('data: ')) {
+      try {
+        const data = JSON.parse(message.substring(6));
+        if (data.status === 'processing') {
+          setProgress({ status: 'ocr', message: data.message || `Processing page ${data.page}...`, processedPages: data.page, totalPages: data.total });
+        } else if (data.status === 'complete') {
+          setPages(data.data);
+          setProgress({ status: 'success', message: 'Processing Complete!', processedPages: data.data.length, totalPages: data.data.length });
+        } else if (data.status === 'error') {
+          setError(data.message);
+          setProgress({ status: 'error', message: 'An error occurred', processedPages: 0, totalPages: 0 });
+        }
+      } catch (e) { console.error("Failed to parse JSON from stream:", e); }
+    }
+  };
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -53,23 +71,6 @@ const App: React.FC = () => {
         setError(`Failed to process file: ${err.message}`);
         setProgress({ status: 'error', message: 'Failed', processedPages: 0, totalPages: 0 });
       });
-      
-    const handleMessage = (message: string) => {
-      if (message.startsWith('data: ')) {
-        try {
-          const data = JSON.parse(message.substring(6));
-          if (data.status === 'processing') {
-            setProgress({ status: 'ocr', message: data.message || `Processing page ${data.page}...`, processedPages: data.page, totalPages: data.total });
-          } else if (data.status === 'complete') {
-            setPages(data.data);
-            setProgress({ status: 'success', message: 'Processing Complete!', processedPages: data.data.length, totalPages: data.data.length });
-          } else if (data.status === 'error') {
-            setError(data.message);
-            setProgress({ status: 'error', message: 'An error occurred', processedPages: 0, totalPages: 0 });
-          }
-        } catch (e) { console.error("Failed to parse JSON from stream:", e); }
-      }
-    };
   };
 
   const createGoogleDoc = async (token: string) => {
@@ -79,19 +80,8 @@ const App: React.FC = () => {
     setError(null);
 
     try {
-      let pagesToProcess = pages;
-      if (targetLanguage) {
-        setProgress({ status: 'ocr', message: `Translating to ${targetLanguage}...`, processedPages: 0, totalPages: pages.length });
-        const response = await fetch('/api/translate_document', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pages, targetLanguage })
-        });
-        if (!response.ok) throw new Error('Translation failed.');
-        pagesToProcess = await response.json();
-        setProgress({ status: 'success', message: 'Translation complete!', processedPages: pages.length, totalPages: pages.length });
-      }
-
+      const pagesToProcess = pages;
+      
       setProgress({ status: 'ocr', message: 'Creating Google Doc...', processedPages: 0, totalPages: 1 });
       const docResponse = await fetch('/api/create_google_doc', {
         method: 'POST',
@@ -127,7 +117,7 @@ const App: React.FC = () => {
     onError: () => {
       setError('Google login failed. Please try again.');
     },
-    scope: 'https://www.googleapis.com/auth/drive.file' // Request only the scope we need
+    scope: 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly' // Request the necessary scopes
   });
 
   const handleCreateClick = () => {
@@ -143,7 +133,6 @@ const App: React.FC = () => {
   const handleReset = () => {
     if (fileInputRef.current) fileInputRef.current.value = "";
     setOriginalFileName('');
-    setTargetLanguage('');
     setPages([]);
     setError(null);
     setProgress({ status: 'idle', message: '', processedPages: 0, totalPages: 0 });
@@ -178,6 +167,64 @@ const App: React.FC = () => {
               <p className="mt-1 text-sm text-gray-500">PDF files only</p>
               <input type="file" accept="application/pdf" onChange={handleFileChange} ref={fileInputRef} className="hidden" aria-label="File uploader" />
             </div>
+          )}
+
+          {progress.status === 'idle' && (
+            <div className="mt-4">
+              <button 
+                onClick={() => userToken ? setShowDrivePicker(true) : login()}
+                className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition-colors duration-200"
+              >
+                Select from Google Drive
+              </button>
+            </div>
+          )}
+
+          {showDrivePicker && userToken && (
+            <DriveFilePicker
+              userToken={userToken}
+              onClose={() => setShowDrivePicker(false)}
+              onFileSelect={(fileId, fileName) => {
+                setShowDrivePicker(false);
+                setOriginalFileName(fileName.replace(/\.pdf$/i, ''));
+                setError(null);
+                setPages([]);
+                setGdocUrl(null);
+                setProgress({ status: 'ocr', message: 'Downloading file from Google Drive...', processedPages: 0, totalPages: 0 });
+
+                fetch('/api/process_drive_file', { 
+                  method: 'POST', 
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${userToken}`
+                  },
+                  body: JSON.stringify({ fileId, fileName })
+                })
+                .then(response => {
+                  if (!response.ok || !response.body) throw new Error('Network response was not ok.');
+                  const reader = response.body.getReader();
+                  const decoder = new TextDecoder();
+                  let buffer = '';
+
+                  const processStream = () => {
+                    reader.read().then(({ done, value }) => {
+                      if (done) { if (buffer) handleMessage(buffer); return; }
+                      buffer += decoder.decode(value, { stream: true });
+                      let boundary;
+                      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+                        handleMessage(buffer.substring(0, boundary));
+                        buffer = buffer.substring(boundary + 2);
+                      }
+                      processStream();
+                    });
+                  };
+                  processStream();
+                }).catch(err => {
+                  setError(`Failed to process file: ${err.message}`);
+                  setProgress({ status: 'error', message: 'Failed', processedPages: 0, totalPages: 0 });
+                });
+              }}
+            />
           )}
 
           {isProcessing && (
@@ -219,29 +266,6 @@ const App: React.FC = () => {
                 ) : (
                   <p className="mb-6 text-gray-600">Your document is ready to be created in Google Docs.</p>
                 )}
-
-               <div className="formatting-options w-full max-w-lg mx-auto bg-gray-50 p-4 rounded-lg border border-gray-200 mb-6">
-                    <h3 className="text-lg font-semibold text-gray-800 mb-4">Document Options</h3>
-                    <div className="flex justify-center items-center gap-4">
-                        <label htmlFor="language-select" className="text-gray-700 font-medium text-sm">Translate to:</label>
-                        <select 
-                          id="language-select" 
-                          value={targetLanguage} 
-                          onChange={(e) => setTargetLanguage(e.target.value)} 
-                          disabled={isActionInProgress} 
-                          className="bg-white border border-gray-300 rounded-md shadow-sm px-3 py-1 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-                        >
-                            <option value="">-- No Translation --</option>
-                            <option value="English">English</option>
-                            <option value="Ukrainian">Ukrainian</option>
-                            <option value="German">German</option>
-                            <option value="French">French</option>
-                            <option value="Spanish">Spanish</option>
-                            <option value="Italian">Italian</option>
-                            <option value="Polish">Polish</option>
-                        </select>
-                    </div>
-                </div>
 
                <div className="flex justify-center items-center gap-4 flex-wrap">
                     <button onClick={handleCreateClick} disabled={isActionInProgress || !!gdocUrl} className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg transition-colors duration-200 disabled:bg-gray-400">
