@@ -209,14 +209,17 @@ async def create_google_doc_endpoint(request: CreateDocRequest, authorization: s
 
         for i, page in enumerate(request.pages):
             requests = []
+            
+            # Always insert a newline before any element to ensure we are in a valid paragraph
+            requests.append({'insertText': {'text': '\n', 'location': {'index': current_index}}})
+            current_index += 1
+
             for element in page.structure:
                 content = element.get('content', '')
+                content = content.replace('&nbsp;', ' ') # Replace &nbsp; with a regular space
                 if not content.strip(): continue
 
                 if element.get('type') == 'table':
-                    # Insert a newline to ensure we are in a paragraph
-                    requests.append({'insertText': {'text': '\n', 'location': {'index': current_index}}})
-                    
                     tokens = md.parse(content)
                     rows_data = []
                     current_row = []
@@ -235,12 +238,9 @@ async def create_google_doc_endpoint(request: CreateDocRequest, authorization: s
                     num_cols = max(len(r) for r in rows_data) if rows_data else 0
                     if num_cols == 0: continue
 
-                    requests.append({'insertTable': {'rows': num_rows, 'columns': num_cols, 'location': {'index': current_index + 1}}})
+                    requests.append({'insertTable': {'rows': num_rows, 'columns': num_cols, 'location': {'index': current_index}}})
                     
-                    # This is still a bit of a hack, but it's more likely to work now.
-                    # The table is inserted at current_index + 1.
-                    # The content of the table starts at current_index + 5.
-                    table_start_index = current_index + 1
+                    table_start_index = current_index
                     cell_requests = []
                     for r, row in enumerate(rows_data):
                         for c, cell_text in enumerate(row):
@@ -249,6 +249,8 @@ async def create_google_doc_endpoint(request: CreateDocRequest, authorization: s
                                 cell_requests.append({'insertText': {'text': cell_text, 'location': {'index': cell_location}}})
                     
                     requests.extend(reversed(cell_requests))
+                    # For tables, we don't manually increment current_index here,
+                    # as the batchUpdate will handle it and we'll fetch the new index.
                 else:
                     text_to_insert = content + '\n'
                     requests.append({'insertText': {'text': text_to_insert, 'location': {'index': current_index}}})
@@ -276,6 +278,15 @@ async def create_google_doc_endpoint(request: CreateDocRequest, authorization: s
 
                     if style_request['fields']:
                         requests.append({'updateParagraphStyle': style_request})
+                    
+                    # Add font size 10pt using updateTextStyle
+                    requests.append({'updateTextStyle': {
+                        'range': {'startIndex': current_index, 'endIndex': current_index + len(text_to_insert)},
+                        'textStyle': {'fontSize': {'magnitude': 10, 'unit': 'PT'}},
+                        'fields': 'fontSize'
+                    }})
+
+                    current_index += len(text_to_insert)
             
             if i < len(request.pages) - 1:
                 requests.append({'insertPageBreak': {'location': {'index': current_index}}})
